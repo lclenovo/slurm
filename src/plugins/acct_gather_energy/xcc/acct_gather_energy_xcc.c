@@ -79,14 +79,22 @@ slurmd_conf_t *conf = NULL;
 #define MAX_LOG_ERRORS 5	/* Max sensor reading errors log messages */
 #define XCC_MIN_RES 50		/* Minimum resolution for XCC readings, in ms */
 #define IPMI_RAW_MAX_ARGS 256 /* Max XCC response length in bytes*/
+#define XCC_SR630V2_RESPONSE_LEN 20 /* SR630 V2 response length */
 /*FIXME: Investigate which is the OVERFLOW limit for XCC*/
 #define IPMI_XCC_OVERFLOW INFINITE /* XCC overflows at X */
 
 #define XCC_FLAG_NONE 0x00000000
 #define XCC_FLAG_FAKE 0x00000001
+#define XCC_FLAG_SR630V2 0x00000002
+
 /* Match cmd_rq[] response expectations */
 #define XCC_SD650_RESPONSE_LEN 16
 #define XCC_SD650V2_RESPONSE_LEN 40
+
+/* SR630 response */
+#define XCC_SR630V2_RESPONSE_LEN 20
+#define XCC_SR630V2_CMD_NETFN 0x2c
+#define XCC_SR630V2_CMD_CODE 0x0
 
 /*
  * These variables are required by the generic plugin interface.  If they
@@ -214,10 +222,12 @@ typedef struct slurm_ipmi_conf {
 
 typedef enum xcc_version {
 	XCC_SD650_VERSION = 0,
-	XCC_SD650V2_VERSION
+  XCC_SD650V2_VERSION,
+  XCC_SR630V2_VERSION
 } xcc_version_t;
 
-/* Struct to store the raw single data command reading */
+
+// Update struct to include min/max/avg power
 typedef struct xcc_raw_single_data {
 	uint16_t fifo_inx;	/* Not used. */
 	uint32_t j;		/* Joules. */
@@ -227,6 +237,12 @@ typedef struct xcc_raw_single_data {
 	uint32_t s;		/* Seconds. */
 	xcc_version_t version;	/* Version. */
 	uint32_t w;		/* Watts. */
+  uint16_t w_min;               /* Minimum watts (SR630V2 only). */
+  uint16_t w_max;               /* Maximum watts (SR630V2 only). */
+  uint16_t w_avg;               /* Average watts (SR630V2 only). */
+  uint8_t group_id;     /* Group ID (SR630V2 only). */
+  uint16_t period_ms;   /* Measurement period in ms (SR630V2 only). */
+  uint8_t state;                /* State (SR630V2 only). */
 } xcc_raw_single_data_t;
 
 static acct_gather_energy_t xcc_energy;
@@ -235,6 +251,9 @@ static acct_gather_energy_t xcc_energy;
 static uint8_t cmd_rq[8] = { 0x00, 0x3A, 0x32, 4, 2, 0, 0, 0 };
 static unsigned int cmd_rq_len = 8;
 
+/* SR630 V2 command */
+static uint8_t cmd_rq_sr630v2[6] = { 0x00, 0x2c, 0x02, 0xdc, 0x01, 0x00 };
+static unsigned int cmd_rq_sr630v2_len = 6;
 
 static int dataset_id = -1; /* id of the dataset for profile data */
 
@@ -438,6 +457,94 @@ cleanup:
 }
 
 /*
+ * _detect_hardware_type - Detect which XCC hardware variant is present
+ */
+static xcc_version_t _detect_hardware_type(ipmi_ctx_t ipmi_ctx)
+{
+  uint8_t buf_rs[IPMI_RAW_MAX_ARGS];
+  int rs_len;
+
+  /* Check if user forced a specific hardware type */
+  if (slurm_ipmi_conf.flags & XCC_FLAG_SR630V2) {
+    info("SR630V2 hardware type forced via configuration");
+    memcpy(cmd_rq, cmd_rq_sr630v2, cmd_rq_sr630v2_len);
+    cmd_rq_len = cmd_rq_sr630v2_len;
+    return XCC_SR630V2_VERSION;
+  }
+
+  /* Try SR630V2 command first (newer hardware) */
+  debug("Attempting SR630V2 hardware detection");
+  rs_len = ipmi_cmd_raw(ipmi_ctx,
+                        cmd_rq_sr630v2[0],
+                        cmd_rq_sr630v2[1],
+                        &cmd_rq_sr630v2[2],
+                        cmd_rq_sr630v2_len - 2,
+                        buf_rs,
+                        IPMI_RAW_MAX_ARGS);
+
+  if (rs_len == XCC_SR630V2_RESPONSE_LEN && buf_rs[1] == 0x00) {
+    info("Detected SR630V2 hardware (response length %d bytes)", rs_len);
+    /* Update global command to use SR630V2 */
+    memcpy(cmd_rq, cmd_rq_sr630v2, cmd_rq_sr630v2_len);
+    cmd_rq_len = cmd_rq_sr630v2_len;
+    return XCC_SR630V2_VERSION;
+  }
+
+  debug("SR630V2 detection failed (got %d bytes), trying SD650 variants", rs_len);
+
+  /* Try SD650 command (original command in global cmd_rq) */
+  uint8_t cmd_rq_sd650[8] = { 0x00, 0x3A, 0x32, 4, 2, 0, 0, 0 };
+  rs_len = ipmi_cmd_raw(ipmi_ctx,
+                        cmd_rq_sd650[0],
+                        cmd_rq_sd650[1],
+                        &cmd_rq_sd650[2],
+                        6, /* length */
+                        buf_rs,
+                        IPMI_RAW_MAX_ARGS);
+
+  if (rs_len == XCC_SD650_RESPONSE_LEN && buf_rs[1] == 0x00) {
+    info("Detected SD650 hardware (response length %d bytes)", rs_len);
+    /* cmd_rq already set to SD650 command by default */
+    return XCC_SD650_VERSION;
+  } else if (rs_len == XCC_SD650V2_RESPONSE_LEN && buf_rs[1] == 0x00) {
+    info("Detected SD650V2 hardware (response length %d bytes)", rs_len);
+    /* cmd_rq already set to SD650 command by default */
+    return XCC_SD650V2_VERSION;
+  }
+
+  error("Could not detect XCC hardware type. SR630V2: %d bytes (expected %d), SD650: %d bytes (expected %d or %d)",
+        rs_len, XCC_SR630V2_RESPONSE_LEN, rs_len,
+        XCC_SD650_RESPONSE_LEN, XCC_SD650V2_RESPONSE_LEN);
+  return -1;
+}
+
+/*
+ * _init_ipmi_config_with_detection - Initialize IPMI and detect hardware
+ */
+static int _init_ipmi_config_with_detection(ipmi_ctx_t *ipmi_ctx_p)
+{
+  static xcc_version_t detected_hardware = -1;
+  int rc;
+
+  /* First initialize IPMI context */
+  rc = _init_ipmi_config(ipmi_ctx_p);
+  if (rc != SLURM_SUCCESS)
+    return rc;
+
+  /* Detect hardware type on first call */
+  if (detected_hardware == -1) {
+    detected_hardware = _detect_hardware_type(*ipmi_ctx_p);
+    if (detected_hardware == -1) {
+      error("%s: Failed to detect XCC hardware type", __func__);
+      _close_ipmi_context(ipmi_ctx_p);
+      return SLURM_ERROR;
+    }
+  }
+
+  return SLURM_SUCCESS;
+}
+
+/*
  * _read_ipmi_values read the Power sensor and update last_update_watt and times
  */
 static xcc_raw_single_data_t *_read_ipmi_values(ipmi_ctx_t *ipmi_ctx_p)
@@ -460,13 +567,22 @@ static xcc_raw_single_data_t *_read_ipmi_values(ipmi_ctx_t *ipmi_ctx_p)
 			      &buf_rs, // response buffer
 			      IPMI_RAW_MAX_ARGS // max response length
 		);
+  info("XCC rq: lun=0x%02x netfn=0x%02x cmd=0x%02x data=%02x %02x %02x %02x %02x (len=%d)",
+       cmd_rq[0], cmd_rq[1], cmd_rq[2], cmd_rq[3], cmd_rq[4], cmd_rq[5], cmd_rq[6], cmd_rq[7], cmd_rq_len);
+  if (rs_len > 0) {
+    if (rs_len == 1)
+      info("XCC rs: len=%d b0=0x%02x", rs_len, buf_rs[0]);
+    else
+      info("XCC rs: len=%d b0=0x%02x b1=0x%02x", rs_len, buf_rs[0], buf_rs[1]);
+  }
+
 
 	debug3("ipmi_cmd_raw: %s", ipmi_ctx_errormsg(ipmi_ctx));
 
 	if ((rs_len != XCC_SD650_RESPONSE_LEN) &&
-	    (rs_len != XCC_SD650V2_RESPONSE_LEN)) {
-		error("Invalid ipmi response length for XCC raw command: %d bytes, expected %d (SD650) or %d (SD650V2)",
-		      rs_len, XCC_SD650_RESPONSE_LEN, XCC_SD650V2_RESPONSE_LEN);
+      (rs_len != XCC_SD650V2_RESPONSE_LEN) &&
+      (rs_len != XCC_SR630V2_RESPONSE_LEN)) {
+    error("Invalid ipmi response length for XCC raw command: %d bytes, expected %d (SD650), %d (SD650V2), or %d (SR630V2)", rs_len, XCC_SD650_RESPONSE_LEN, XCC_SD650V2_RESPONSE_LEN, XCC_SR630V2_RESPONSE_LEN);
 		return NULL;
 	}
 
@@ -499,6 +615,57 @@ static xcc_raw_single_data_t *_read_ipmi_values(ipmi_ctx_t *ipmi_ctx_p)
 		memcpy(&xcc_reading->mj, buf_rs + 8, 2);
 		memcpy(&xcc_reading->s, buf_rs + 10, 4);
 		memcpy(&xcc_reading->ms, buf_rs + 14, 2);
+  } else if (rs_len == XCC_SR630V2_RESPONSE_LEN) {
+    /*
+     * SR630 V2 format (Lenovo XCC3 OEM command)
+     * Based on Lenovo XCC3 OEM IPMI specification:
+     * https://pubs.lenovo.com/xcc3/oem_ipmi_commands
+     *
+     * Response format:
+     * Byte  0-1:  Header (CMD echo, Completion code)
+     * Byte  2:    GroupID
+     * Byte  3-4:  Current Power (uint16, little-endian)
+     * Byte  5-6:  Minimum Power (uint16, little-endian)
+     * Byte  7-8:  Maximum Power (uint16, little-endian)
+     * Byte  9-10: Average Power (uint16, little-endian)
+     * Byte 11-14: Timestamp (uint32, Unix epoch)
+     * Byte 15-16: Period (uint16, milliseconds)
+     * Byte 17-18: Reserved
+     * Byte 19:    State
+     */
+    xcc_reading->version = XCC_SR630V2_VERSION;
+    xcc_reading->fifo_inx = 0;
+
+    /* Byte 2: Group ID */
+    xcc_reading->group_id = buf_rs[2];
+
+    /* Bytes 3-4: Current Power (uint16, little-endian) */
+    memcpy(&xcc_reading->w, buf_rs + 3, 2);
+    xcc_reading->mw = 0;
+
+    /* Bytes 5-6: Minimum Power */
+    memcpy(&xcc_reading->w_min, buf_rs + 5, 2);
+
+    /* Bytes 7-8: Maximum Power */
+    memcpy(&xcc_reading->w_max, buf_rs + 7, 2);
+
+    /* Bytes 9-10: Average Power */
+    memcpy(&xcc_reading->w_avg, buf_rs + 9, 2);
+
+    /* Bytes 11-14: Timestamp (uint32, Unix epoch) */
+    memcpy(&xcc_reading->s, buf_rs + 11, 4);
+    xcc_reading->ms = 0;
+
+    /* Bytes 15-16: Period (in milliseconds) */
+    memcpy(&xcc_reading->period_ms, buf_rs + 15, 2);
+
+    /* Byte 19: State */
+    xcc_reading->state = buf_rs[19];
+
+    /* Energy will be calculated in update function */
+    xcc_reading->j = 0;
+    xcc_reading->mj = 0;
+    xcc_reading->w_min = xcc_reading->w_max = xcc_reading->w_avg = 0;
 	} else {
 		/* Ignore response header first 2 bytes like above. */
 		int count = 0;
@@ -648,6 +815,67 @@ static void _sd650v2_update_node_energy(xcc_raw_single_data_t *xcc_raw)
 		 xcc_energy.consumed_energy, elapsed, xcc_energy.ave_watts);
 }
 
+static void _sr630v2_update_node_energy(xcc_raw_single_data_t *xcc_raw)
+{
+  static uint64_t readings = 0;
+  int elapsed = 0;
+
+  if (!xcc_energy.poll_time) {
+    /* First reading - initialize */
+    xcc_energy.consumed_energy = 0;
+    xcc_energy.base_consumed_energy = 0;
+    xcc_energy.previous_consumed_energy = 0;
+
+    /* Use XCC's reported average power for initial value */
+    xcc_energy.ave_watts = xcc_raw->w_avg;
+    xcc_energy.current_watts = xcc_raw->w;
+    readings++;
+
+    log_flag(ENERGY, "SR630V2: First reading - GroupID=%u, Current=%uW, Min=%uW, Max=%uW, XCC_Avg=%uW, Period=%ums, State=0x%02x",
+             xcc_raw->group_id, xcc_raw->w,
+             xcc_raw->w_min, xcc_raw->w_max,
+             xcc_raw->w_avg, xcc_raw->period_ms,
+             xcc_raw->state);
+  } else {
+    elapsed = xcc_raw->s - xcc_energy.poll_time;
+
+    if (elapsed > 0) {
+      xcc_energy.previous_consumed_energy =
+        xcc_energy.consumed_energy;
+
+      /*
+       * Calculate energy consumed during this interval
+       * Use trapezoidal rule: average of current and previous power
+       * Energy (J) = Power (W) × Time (s)
+       */
+      uint32_t avg_power_interval =
+        (xcc_energy.current_watts + xcc_raw->w) / 2;
+      uint64_t interval_energy =
+        (uint64_t)avg_power_interval * elapsed;
+
+      xcc_energy.consumed_energy += interval_energy;
+      xcc_energy.base_consumed_energy = interval_energy;
+
+      /* Update current power */
+      xcc_energy.current_watts = xcc_raw->w;
+
+      /* Calculate running average watts */
+      xcc_energy.ave_watts =
+        ((xcc_energy.ave_watts * readings) +
+         xcc_energy.current_watts) / (readings + 1);
+      readings++;
+    }
+  }
+
+  xcc_energy.poll_time = xcc_raw->s;
+
+  log_flag(ENERGY, "SR630V2: Current=%uW (Min=%uW Max=%uW XCC_Avg=%uW), Consumed=%"PRIu64"J (interval=%"PRIu64"J over %ds), Running_Avg=%uW",
+           xcc_energy.current_watts, xcc_raw->w_min, xcc_raw->w_max,
+           xcc_raw->w_avg, xcc_energy.consumed_energy,
+           xcc_energy.base_consumed_energy, elapsed,
+           xcc_energy.ave_watts);
+}
+
 /*
  * _thread_update_node_energy calls _read_ipmi_values and updates all values
  * for node consumption.
@@ -671,6 +899,9 @@ static int _thread_update_node_energy(ipmi_ctx_t *ipmi_ctx_p)
 	case XCC_SD650V2_VERSION:
 		_sd650v2_update_node_energy(xcc_raw);
 		break;
+  case XCC_SR630V2_VERSION:
+    _sr630v2_update_node_energy(xcc_raw);
+    break;
 	default:
 		error("Unimplemented energy calculation for returned data");
 		rc = SLURM_ERROR;
@@ -751,7 +982,7 @@ static void *_thread_ipmi_run(void *no_data)
 	(void) pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL);
 
 	slurm_mutex_lock(&ipmi_mutex);
-	if (_init_ipmi_config(&ipmi_ctx) != SLURM_SUCCESS) {
+  if (_init_ipmi_config_with_detection(&ipmi_ctx) != SLURM_SUCCESS) {
 		log_flag(ENERGY, "ipmi-thread: aborted");
 		slurm_mutex_unlock(&ipmi_mutex);
 
@@ -1036,6 +1267,7 @@ extern void acct_gather_energy_p_conf_options(s_p_options_t **full_options,
 		{"EnergyIPMIUsername", S_P_STRING},
 		{"EnergyIPMIWorkaroundFlags", S_P_UINT32},
 		{"EnergyXCCFake", S_P_BOOLEAN},
+    {"EnergyXCCHardwareType", S_P_STRING},
 		{NULL} };
 
 	transfer_s_p_options(full_options, options, full_options_cnt);
@@ -1044,6 +1276,7 @@ extern void acct_gather_energy_p_conf_options(s_p_options_t **full_options,
 extern void acct_gather_energy_p_conf_set(int context_id_in, s_p_hashtbl_t *tbl)
 {
 	bool tmp_bool;
+  char *hw_type_str = NULL;
 
 	/* Set initial values */
 	_reset_slurm_ipmi_conf(&slurm_ipmi_conf);
@@ -1099,6 +1332,20 @@ extern void acct_gather_energy_p_conf_set(int context_id_in, s_p_hashtbl_t *tbl)
 			cmd_rq[3] = 0x36;
 			cmd_rq_len = 4;
 		}
+
+    /* Check for hardware type specification */
+    s_p_get_string(&hw_type_str, "EnergyXCCHardwareType", tbl);
+    if (hw_type_str) {
+      if (!xstrcasecmp(hw_type_str, "SR630V2")) {
+	info("SR630V2 hardware type specified in configuration");
+	slurm_ipmi_conf.flags |= XCC_FLAG_SR630V2;
+      } else if (!xstrcasecmp(hw_type_str, "SD650") ||
+		 !xstrcasecmp(hw_type_str, "SD650V2")) {
+	info("%s hardware type specified in configuration", hw_type_str);
+	/* Default command is already SD650 */
+      }
+      xfree(hw_type_str);
+    }
 	}
 
 	context_id = context_id_in;
@@ -1177,4 +1424,7 @@ extern void acct_gather_energy_p_conf_values(list_t **data)
 
 	add_key_pair(*data, "EnergyIPMIWorkaroundFlags", "%u",
 		     slurm_ipmi_conf.workaround_flags);
+
+  add_key_pair(*data, "EnergyXCCHardwareType", "%s",
+	       (slurm_ipmi_conf.flags & XCC_FLAG_SR630V2) ? "SR630V2" : "Auto-detect");
 }
